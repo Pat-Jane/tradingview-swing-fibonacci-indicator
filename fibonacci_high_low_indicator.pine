@@ -1,0 +1,498 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  Fibonacci Swing Auto-Fib Indicator  (v2 — swing-structure based)
+//
+//  WHAT THIS INDICATOR DOES
+//  ------------------------
+//  This is NOT a simple "highest high / lowest low of the lookback" tool.
+//  It detects the most recent real impulse leg using confirmed market
+//  structure (ta.pivothigh / ta.pivotlow) and places the Fibonacci on it:
+//
+//  1. MODE DETECTION — Bullish, Bearish, or Neutral:
+//     • Bullish  = price above the EMA trend filter AND a valid impulse
+//       from a confirmed swing low up to a confirmed swing high exists.
+//     • Bearish  = price below the EMA trend filter AND a valid impulse
+//       from a confirmed swing high down to a confirmed swing low exists.
+//     • Neutral  = neither leg qualifies → no fib is drawn.
+//     An impulse only qualifies if its size > ATR × "Min Impulse Size".
+//
+//  2. BULLISH MODE — Fib drawn from the swing low (leg start) to the
+//     swing high (leg end). 0% sits at the swing HIGH, 100% at the swing
+//     LOW, retracements between them, extensions ABOVE the swing high as
+//     continuation targets. Anchors are labeled "Bullish Fib Start" and
+//     "Bullish Fib End / Possible Sell Zone".
+//
+//  3. BEARISH MODE — Fib drawn from the swing high (leg start) to the
+//     swing low (leg end). 0% sits at the swing LOW, 100% at the swing
+//     HIGH, extensions BELOW the swing low. Anchors are labeled
+//     "Bearish Fib Start" and "Bearish Fib End / Possible Buy Zone".
+//
+//  4. SIGNALS — "Potential Sell Zone" / "Potential Buy Zone" labels fire
+//     when price reaches a key zone (0% anchor, prior swing, 127.2% or
+//     161.8% extension) AND at least one confirmation appears (RSI
+//     overbought/oversold, a rejection candle, or a freshly confirmed
+//     pivot). Each label shows a CONFIDENCE score.
+//
+//  5. CONFIDENCE SCORE (0–100%) — a CONFLUENCE score, NOT prediction
+//     accuracy. Points come from: EMA trend alignment, higher-high/
+//     higher-low (or lower-high/lower-low) structure, impulse strength
+//     vs ATR, RSI position, rejection candle, price sitting near a fib
+//     level, and volume above its 20-bar average (when volume exists).
+//
+//  6. HISTORICAL HIT-RATE TABLE — every signal is evaluated after the
+//     "Evaluation Bars" window: a sell signal is a hit if price dropped
+//     ≥ 1 ATR below the signal close; a buy signal is a hit if price
+//     rose ≥ 1 ATR above it. This is a HISTORICAL, chart-based hit rate
+//     for the symbol/timeframe you are viewing. It is NOT a promise of
+//     future accuracy.
+//
+//  ANTI-REPAINT NOTES
+//  ------------------
+//  • No future-leaking functions are used anywhere.
+//  • A pivot needs "Pivot Right Bars" candles AFTER the swing point
+//    before it can be confirmed — so confirmed anchors always appear
+//    with that delay. That delay is the price of reliability.
+//  • Anchor Mode:
+//      "Confirmed" — anchors move only to confirmed pivots. Safest,
+//                    least repainting, but delayed.
+//      "Early"     — if price pushes beyond the last confirmed anchor,
+//                    the fib end follows the developing extreme
+//                    immediately. Faster, but that anchor can keep
+//                    moving (repaint) until a new pivot confirms.
+//  • Signals and alerts only fire on confirmed (closed) bars.
+//
+//  All lines/labels from the previous update are deleted before
+//  redrawing, so the chart stays clean.
+// ─────────────────────────────────────────────────────────────────────────────
+
+indicator("Fibonacci Swing Auto-Fib", shorttitle = "Auto Fib Swing", overlay = true, max_lines_count = 100, max_labels_count = 100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+pivotLeft    = input.int(5,     "Pivot Left Bars",           minval = 1,   group = "Swing Detection")
+pivotRight   = input.int(5,     "Pivot Right Bars",          minval = 1,   group = "Swing Detection", tooltip = "A swing is only CONFIRMED this many bars after it forms. Larger = more reliable pivots, more delay.")
+lookbackBars = input.int(200,   "Lookback Bars",             minval = 20,  group = "Swing Detection", tooltip = "Pivots older than this are ignored when picking fib anchors.")
+atrMult      = input.float(1.5, "Min Impulse Size (× ATR)",  minval = 0.1, step = 0.1, group = "Swing Detection", tooltip = "The swing leg must be larger than ATR × this multiplier to count as a real impulse.")
+anchorMode   = input.string("Confirmed", "Anchor Mode", options = ["Confirmed", "Early"], group = "Swing Detection", tooltip = "Confirmed = anchors only on confirmed pivots (safer, delayed). Early = fib end follows the developing extreme (faster, may repaint).")
+
+emaLen       = input.int(200, "EMA Trend Filter Length",     minval = 1, group = "Filters")
+rsiLen       = input.int(14,  "RSI Length",                  minval = 1, group = "Filters")
+evalBars     = input.int(20,  "Evaluation Bars (hit-rate)",  minval = 1, group = "Filters", tooltip = "A signal counts as a hit if price moves at least 1 ATR in its favor within this many bars.")
+
+showBullFib  = input.bool(true,  "Show Bullish Fibs",        group = "Display")
+showBearFib  = input.bool(true,  "Show Bearish Fibs",        group = "Display")
+showLabels   = input.bool(true,  "Show Labels",              group = "Display")
+showTable    = input.bool(true,  "Show Info Table",          group = "Display")
+extendRight  = input.bool(false, "Extend Fib Lines Right",   group = "Display")
+
+bullColor    = input.color(color.teal, "Bullish Fib Color",  group = "Colors")
+bearColor    = input.color(color.red,  "Bearish Fib Color",  group = "Colors")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+int   SIGNAL_COOLDOWN = 10    // min bars between two signals of the same side
+float NEAR_ATR        = 0.25  // "near a level" = within 0.25 ATR of it
+int   RSI_OB          = 70
+int   RSI_OS          = 30
+
+// Retracement ratios (0% at leg end, 100% at leg start) and extensions
+var array<float> RETR_RATIOS = array.from(0.0, 0.236, 0.382, 0.5, 0.618, 0.705, 0.786, 1.0)
+var array<float> EXT_RATIOS  = array.from(1.272, 1.618, 2.0, 2.618)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CORE SERIES
+// ─────────────────────────────────────────────────────────────────────────────
+
+emaVal      = ta.ema(close, emaLen)
+atrVal      = ta.atr(14)
+rsiVal      = ta.rsi(close, rsiLen)
+rsiSafe     = nz(rsiVal, 50)
+volSMA      = ta.sma(volume, 20)
+lowestEval  = ta.lowest(low, evalBars)    // used to grade expired sell signals
+highestEval = ta.highest(high, evalBars)  // used to grade expired buy signals
+
+// Confirmed pivots. NOTE: a pivot is reported pivotRight bars AFTER the
+// actual swing bar — this confirmation delay is what prevents repainting.
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PIVOT STORAGE + "EARLY MODE" EXTREME TRACKERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<int>   phBars = array.new<int>()
+var array<float> phVals = array.new<float>()
+var array<int>   plBars = array.new<int>()
+var array<float> plVals = array.new<float>()
+
+// Running extreme since the last confirmed pivot (for Early anchor mode)
+var float hiSincePH    = na
+var int   hiSincePHBar = na
+var float loSincePL    = na
+var int   loSincePLBar = na
+
+if not na(ph)
+    array.push(phBars, bar_index - pivotRight)
+    array.push(phVals, ph)
+    if array.size(phBars) > 30
+        array.shift(phBars)
+        array.shift(phVals)
+    hiSincePH    := ph
+    hiSincePHBar := bar_index - pivotRight
+else if not na(hiSincePH) and high > hiSincePH
+    hiSincePH    := high
+    hiSincePHBar := bar_index
+
+if not na(pl)
+    array.push(plBars, bar_index - pivotRight)
+    array.push(plVals, pl)
+    if array.size(plBars) > 30
+        array.shift(plBars)
+        array.shift(plVals)
+    loSincePL    := pl
+    loSincePLBar := bar_index - pivotRight
+else if not na(loSincePL) and low < loSincePL
+    loSincePL    := low
+    loSincePLBar := bar_index
+
+// Latest and previous confirmed pivots (previous ones are used to judge
+// higher-high/higher-low vs lower-high/lower-low structure)
+float lastPH    = na
+int   lastPHBar = na
+float prevPH    = na
+float lastPL    = na
+int   lastPLBar = na
+float prevPL    = na
+
+int nPH = array.size(phBars)
+int nPL = array.size(plBars)
+if nPH > 0
+    lastPH    := array.get(phVals, nPH - 1)
+    lastPHBar := array.get(phBars, nPH - 1)
+if nPH > 1
+    prevPH := array.get(phVals, nPH - 2)
+if nPL > 0
+    lastPL    := array.get(plVals, nPL - 1)
+    lastPLBar := array.get(plBars, nPL - 1)
+if nPL > 1
+    prevPL := array.get(plVals, nPL - 2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  IMPULSE LEG SELECTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Finds the most recent pivot that happened BEFORE `beforeBar` and not
+// earlier than `minBar` — i.e. the swing that started the impulse leg.
+f_latestBefore(array<int> bars, array<float> vals, int beforeBar, int minBar) =>
+    float fv = na
+    int   fb = na
+    int   n  = array.size(bars)
+    if n > 0 and not na(beforeBar)
+        for i = n - 1 to 0
+            int b = array.get(bars, i)
+            if b < beforeBar and b >= minBar
+                fv := array.get(vals, i)
+                fb := b
+                break
+    [fv, fb]
+
+int minBar   = bar_index - lookbackBars
+earlyMode    = anchorMode == "Early"
+
+// Bullish leg: confirmed swing low (start) → confirmed swing high (end)
+[bullStartV, bullStartB] = f_latestBefore(plBars, plVals, lastPHBar, minBar)
+float bullEndEffV = lastPH
+int   bullEndEffB = lastPHBar
+if earlyMode and not na(lastPH) and not na(hiSincePH) and hiSincePH > lastPH
+    bullEndEffV := hiSincePH
+    bullEndEffB := hiSincePHBar
+
+// Bearish leg: confirmed swing high (start) → confirmed swing low (end)
+[bearStartV, bearStartB] = f_latestBefore(phBars, phVals, lastPLBar, minBar)
+float bearEndEffV = lastPL
+int   bearEndEffB = lastPLBar
+if earlyMode and not na(lastPL) and not na(loSincePL) and loSincePL < lastPL
+    bearEndEffV := loSincePL
+    bearEndEffB := loSincePLBar
+
+// Leg validity: anchors exist, end pivot is inside the lookback, and the
+// leg is bigger than ATR × multiplier (filters out noise legs)
+bullLegOk = not na(bullStartV) and not na(lastPH) and not na(lastPHBar) and not na(atrVal) and lastPHBar >= minBar and (bullEndEffV - bullStartV) > atrMult * atrVal
+bearLegOk = not na(bearStartV) and not na(lastPL) and not na(lastPLBar) and not na(atrVal) and lastPLBar >= minBar and (bearStartV - bearEndEffV) > atrMult * atrVal
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MODE DETECTION  (Bullish / Bearish / Neutral)
+// ─────────────────────────────────────────────────────────────────────────────
+
+bullMode = not na(emaVal) and close > emaVal and bullLegOk
+bearMode = not na(emaVal) and close < emaVal and bearLegOk
+isActive = bullMode or bearMode
+string modeTxt = bullMode ? "Bullish" : bearMode ? "Bearish" : "Neutral"
+
+// Structure quality (used in the confidence score, not as a hard gate,
+// because early trends don't always have two pivots yet)
+bullStruct = not na(prevPH) and not na(prevPL) and lastPH > prevPH and lastPL > prevPL
+bearStruct = not na(prevPH) and not na(prevPL) and lastPH < prevPH and lastPL < prevPL
+
+// Active anchors (whichever mode is on)
+float actStartV = na
+int   actStartB = na
+float actEndV   = na
+int   actEndB   = na
+if bullMode
+    actStartV := bullStartV
+    actStartB := bullStartB
+    actEndV   := bullEndEffV
+    actEndB   := bullEndEffB
+else if bearMode
+    actStartV := bearStartV
+    actStartB := bearStartB
+    actEndV   := bearEndEffV
+    actEndB   := bearEndEffB
+float actRng = math.abs(actEndV - actStartV)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIB LEVEL MATH
+//  Bullish: 0% = swing high, 100% = swing low, extensions ABOVE the high.
+//  Bearish: 0% = swing low, 100% = swing high, extensions BELOW the low.
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_retrPrice(bool isBull, float endV, float rng, float ratio) =>
+    isBull ? endV - rng * ratio : endV + rng * ratio
+
+f_extPrice(bool isBull, float startV, float rng, float ratio) =>
+    isBull ? startV + rng * ratio : startV - rng * ratio
+
+float lvl382 = f_retrPrice(bullMode, actEndV, actRng, 0.382)
+float lvl50  = f_retrPrice(bullMode, actEndV, actRng, 0.5)
+float lvl618 = f_retrPrice(bullMode, actEndV, actRng, 0.618)
+float lvl786 = f_retrPrice(bullMode, actEndV, actRng, 0.786)
+float ext1272 = f_extPrice(bullMode, actStartV, actRng, 1.272)
+float ext1618 = f_extPrice(bullMode, actStartV, actRng, 1.618)
+
+// "Near a level" = within NEAR_ATR × ATR of it
+f_near(float p) =>
+    not na(p) and not na(atrVal) and math.abs(close - p) <= NEAR_ATR * atrVal
+
+bool nearFib = false
+if isActive and not na(atrVal)
+    for i = 0 to array.size(RETR_RATIOS) - 1
+        if f_near(f_retrPrice(bullMode, actEndV, actRng, array.get(RETR_RATIOS, i)))
+            nearFib := true
+    for i = 0 to array.size(EXT_RATIOS) - 1
+        if f_near(f_extPrice(bullMode, actStartV, actRng, array.get(EXT_RATIOS, i)))
+            nearFib := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONFIRMATION CONDITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+float bodySize = math.abs(close - open)
+bearReject = close < open and (high - math.max(open, close)) > bodySize  // long upper wick
+bullReject = close > open and (math.min(open, close) - low) > bodySize   // long lower wick
+volOk      = not na(volume) and not na(volSMA) and volume > volSMA
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONFIDENCE (CONFLUENCE) SCORE — 0..100
+//  This measures how many independent conditions currently agree.
+//  It is NOT a probability of success and NOT prediction accuracy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+int conf = 0
+if isActive
+    conf += 20                                                              // trend aligned with EMA filter (implied by mode)
+    conf += (bullMode ? bullStruct : bearStruct) ? 15 : 0                   // valid HH/HL or LH/LL pivot structure
+    conf += actRng > 2 * atrMult * atrVal ? 15 : 10                         // impulse strength vs ATR (valid legs already beat the minimum)
+    conf += bullMode ? (rsiSafe >= RSI_OB ? 15 : rsiSafe >= 60 ? 8 : 0) : (rsiSafe <= RSI_OS ? 15 : rsiSafe <= 40 ? 8 : 0)  // RSI confirmation
+    conf += (bullMode ? bearReject : bullReject) ? 15 : 0                   // rejection candle at the zone
+    conf += nearFib ? 10 : 0                                                // price reacting near a fib level
+    conf += volOk ? 10 : 0                                                  // volume above its 20-bar average (if volume exists)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BUY / SELL ZONE SIGNALS
+//  Zone touch (price condition) + at least one confirmation, on bar close
+//  only (anti-repaint), with a cooldown so the chart doesn't get spammed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int lastSellSigBar = -100000
+var int lastBuySigBar  = -100000
+
+newPHConfirmed = not na(ph)
+newPLConfirmed = not na(pl)
+
+sellZoneHit = bullMode and (high >= actEndV or (not na(prevPH) and high >= prevPH) or f_near(ext1272) or f_near(ext1618))
+sellConfirm = rsiSafe >= RSI_OB or bearReject or newPHConfirmed
+sellSignal  = sellZoneHit and sellConfirm and barstate.isconfirmed and bar_index - lastSellSigBar > SIGNAL_COOLDOWN
+
+buyZoneHit  = bearMode and (low <= actEndV or (not na(prevPL) and low <= prevPL) or f_near(ext1272) or f_near(ext1618))
+buyConfirm  = rsiSafe <= RSI_OS or bullReject or newPLConfirmed
+buySignal   = buyZoneHit and buyConfirm and barstate.isconfirmed and bar_index - lastBuySigBar > SIGNAL_COOLDOWN
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HISTORICAL HIT-RATE TRACKER
+//  Each signal is stored and graded evalBars later:
+//    sell hit = price fell ≥ 1 ATR below the signal close within the window
+//    buy hit  = price rose ≥ 1 ATR above the signal close within the window
+//  This is a chart-based HISTORICAL statistic, not future accuracy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<int>   pendBarArr   = array.new<int>()
+var array<int>   pendDirArr   = array.new<int>()    // 1 = sell, -1 = buy
+var array<float> pendCloseArr = array.new<float>()
+var array<float> pendATRArr   = array.new<float>()
+var array<label> sigLabels    = array.new<label>()
+
+var int sellSigCount = 0
+var int sellSigHits  = 0
+var int buySigCount  = 0
+var int buySigHits   = 0
+
+if sellSignal
+    lastSellSigBar := bar_index
+    array.push(pendBarArr, bar_index)
+    array.push(pendDirArr, 1)
+    array.push(pendCloseArr, close)
+    array.push(pendATRArr, atrVal)
+    if showLabels
+        label sl = label.new(bar_index, high, "Potential Sell Zone — Confidence " + str.tostring(conf) + "%", xloc = xloc.bar_index, style = label.style_label_down, color = color.new(bearColor, 10), textcolor = color.white, size = size.small)
+        array.push(sigLabels, sl)
+
+if buySignal
+    lastBuySigBar := bar_index
+    array.push(pendBarArr, bar_index)
+    array.push(pendDirArr, -1)
+    array.push(pendCloseArr, close)
+    array.push(pendATRArr, atrVal)
+    if showLabels
+        label bl = label.new(bar_index, low, "Potential Buy Zone — Confidence " + str.tostring(conf) + "%", xloc = xloc.bar_index, style = label.style_label_up, color = color.new(bullColor, 10), textcolor = color.white, size = size.small)
+        array.push(sigLabels, bl)
+
+// keep only the most recent signal labels to avoid clutter
+while array.size(sigLabels) > 12
+    label.delete(array.shift(sigLabels))
+
+// grade pending signals whose evaluation window has elapsed
+if array.size(pendBarArr) > 0
+    for i = array.size(pendBarArr) - 1 to 0
+        int sBar = array.get(pendBarArr, i)
+        if bar_index - sBar >= evalBars
+            int   dir    = array.get(pendDirArr, i)
+            float sClose = array.get(pendCloseArr, i)
+            float sATR   = array.get(pendATRArr, i)
+            if dir == 1
+                sellSigCount += 1
+                if sClose - lowestEval >= sATR
+                    sellSigHits += 1
+            else
+                buySigCount += 1
+                if highestEval - sClose >= sATR
+                    buySigHits += 1
+            array.remove(pendBarArr, i)
+            array.remove(pendDirArr, i)
+            array.remove(pendCloseArr, i)
+            array.remove(pendATRArr, i)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DRAWING  (last bar only — old drawings are deleted first, no clutter)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<line>  fibLines  = array.new<line>()
+var array<label> fibLabels = array.new<label>()
+
+f_fmtRatio(float r) =>
+    str.tostring(r * 100, "#.##") + "%"
+
+f_drawLevel(int x1, float price, string txt, color col, int width, string lstyle) =>
+    line ln = line.new(x1, price, bar_index, price, xloc = xloc.bar_index, extend = extendRight ? extend.right : extend.none, color = col, style = lstyle, width = width)
+    array.push(fibLines, ln)
+    if showLabels and txt != ""
+        label lb = label.new(bar_index, price, txt, xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 100), textcolor = col, size = size.small)
+        array.push(fibLabels, lb)
+
+f_drawFib(bool isBull, int sBar, float sVal, int eBar, float eVal, color col) =>
+    float rng = math.abs(eVal - sVal)
+    int   x1  = math.min(sBar, eBar)
+    // retracement levels (0% at leg end, 100% at leg start)
+    for i = 0 to array.size(RETR_RATIOS) - 1
+        float r = array.get(RETR_RATIOS, i)
+        float p = isBull ? eVal - rng * r : eVal + rng * r
+        bool isAnchor = r == 0.0 or r == 1.0
+        f_drawLevel(x1, p, "Fib " + f_fmtRatio(r) + " — " + str.tostring(p, format.mintick), col, isAnchor ? 2 : 1, isAnchor ? line.style_solid : line.style_dashed)
+    // extension levels (projected past the leg end as continuation targets)
+    for i = 0 to array.size(EXT_RATIOS) - 1
+        float r = array.get(EXT_RATIOS, i)
+        float p = isBull ? sVal + rng * r : sVal - rng * r
+        f_drawLevel(x1, p, "Fib Ext " + f_fmtRatio(r) + " — " + str.tostring(p, format.mintick), color.new(col, 25), 1, line.style_dotted)
+    // diagonal impulse line from fib start to fib end
+    line diag = line.new(sBar, sVal, eBar, eVal, xloc = xloc.bar_index, color = color.new(col, 35), style = line.style_dashed, width = 2)
+    array.push(fibLines, diag)
+    // anchor markers (text labels, or small dots when labels are off)
+    string sTxt = isBull ? "Bullish Fib Start" : "Bearish Fib Start"
+    string eTxt = isBull ? "Bullish Fib End / Possible Sell Zone" : "Bearish Fib End / Possible Buy Zone"
+    label sLab = label.new(sBar, sVal, showLabels ? sTxt : "", xloc = xloc.bar_index, style = showLabels ? (isBull ? label.style_label_up : label.style_label_down) : label.style_circle, color = showLabels ? color.new(col, 10) : col, textcolor = color.white, size = showLabels ? size.small : size.tiny)
+    array.push(fibLabels, sLab)
+    label eLab = label.new(eBar, eVal, showLabels ? eTxt : "", xloc = xloc.bar_index, style = showLabels ? (isBull ? label.style_label_down : label.style_label_up) : label.style_circle, color = showLabels ? color.new(col, 10) : col, textcolor = color.white, size = showLabels ? size.small : size.tiny)
+    array.push(fibLabels, eLab)
+
+if barstate.islast
+    for ln in fibLines
+        line.delete(ln)
+    array.clear(fibLines)
+    for lb in fibLabels
+        label.delete(lb)
+    array.clear(fibLabels)
+    if bullMode and showBullFib
+        f_drawFib(true, bullStartB, bullStartV, bullEndEffB, bullEndEffV, bullColor)
+    else if bearMode and showBearFib
+        f_drawFib(false, bearStartB, bearStartV, bearEndEffB, bearEndEffV, bearColor)
+
+// EMA trend filter (subtle; hide it from the Style tab if unwanted)
+plot(emaVal, "EMA Trend Filter", color = color.new(color.gray, 60))
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INFO TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table statsTbl = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 80), frame_color = color.new(color.gray, 50), frame_width = 1, border_color = color.new(color.gray, 70), border_width = 1)
+
+if barstate.islast and showTable
+    color modeColor = bullMode ? bullColor : bearMode ? bearColor : color.gray
+    string sellRateTxt = sellSigCount > 0 ? str.tostring(100.0 * sellSigHits / sellSigCount, "#.#") + "%  (" + str.tostring(sellSigHits) + "/" + str.tostring(sellSigCount) + ")" : "no signals yet"
+    string buyRateTxt  = buySigCount  > 0 ? str.tostring(100.0 * buySigHits  / buySigCount,  "#.#") + "%  (" + str.tostring(buySigHits)  + "/" + str.tostring(buySigCount)  + ")" : "no signals yet"
+    table.cell(statsTbl, 0, 0, "Mode",              text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 1, 0, modeTxt,             text_color = modeColor,   text_size = size.small)
+    table.cell(statsTbl, 0, 1, "Fib Direction",     text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 1, 1, bullMode ? "Low → High (Bullish)" : bearMode ? "High → Low (Bearish)" : "None", text_color = modeColor, text_size = size.small)
+    table.cell(statsTbl, 0, 2, "Confidence",        text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 1, 2, isActive ? str.tostring(conf) + "%" : "—", text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 0, 3, "Sell Hit Rate",     text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 1, 3, sellRateTxt,         text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 0, 4, "Buy Hit Rate",      text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 1, 4, buyRateTxt,          text_color = color.white, text_size = size.small)
+    table.cell(statsTbl, 0, 5, "Note",              text_color = color.gray,  text_size = size.tiny)
+    table.cell(statsTbl, 1, 5, "Historical stats — not predictive", text_color = color.gray, text_size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+newBullFib = bullMode and (not bullMode[1] or lastPHBar != lastPHBar[1])
+newBearFib = bearMode and (not bearMode[1] or lastPLBar != lastPLBar[1])
+
+touch382 = not na(lvl382) and low <= lvl382 and high >= lvl382
+touch50  = not na(lvl50)  and low <= lvl50  and high >= lvl50
+touch618 = not na(lvl618) and low <= lvl618 and high >= lvl618
+touch786 = not na(lvl786) and low <= lvl786 and high >= lvl786
+
+alertcondition(newBullFib, title = "New Bullish Fib Detected",  message = "A new bullish impulse leg was detected — Fibonacci re-anchored from swing low to swing high.")
+alertcondition(newBearFib, title = "New Bearish Fib Detected",  message = "A new bearish impulse leg was detected — Fibonacci re-anchored from swing high to swing low.")
+alertcondition(sellSignal, title = "Potential Sell Zone",       message = "Potential Sell Zone — price reached a resistance zone with confirmation.")
+alertcondition(buySignal,  title = "Potential Buy Zone",        message = "Potential Buy Zone — price reached a support zone with confirmation.")
+alertcondition(touch382,   title = "Price Touched Fib 38.2%",   message = "Price touched the Fibonacci 38.2% level.")
+alertcondition(touch50,    title = "Price Touched Fib 50%",     message = "Price touched the Fibonacci 50% level.")
+alertcondition(touch618,   title = "Price Touched Fib 61.8%",   message = "Price touched the Fibonacci 61.8% level.")
+alertcondition(touch786,   title = "Price Touched Fib 78.6%",   message = "Price touched the Fibonacci 78.6% level.")
