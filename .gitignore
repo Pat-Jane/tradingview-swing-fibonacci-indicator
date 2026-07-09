@@ -1,0 +1,20 @@
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary / backup files
+*.tmp
+*.bak
+*.log
+
+# Local notes and scratch files (keep goal.txt out of the public repo)
+goal.txt
+notes/
